@@ -13,10 +13,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  publish:
+  build:
     if: github.repository == 'trackpac-ltd/chirpstack'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            target: aarch64-unknown-linux-musl
     permissions:
       contents: read
       packages: write
@@ -36,11 +43,16 @@ jobs:
             ~/.cargo/registry/
             ~/.cargo/git/
             target/
-          key: fork-image-amd64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'cross/Dockerfile.x86_64-unknown-linux-musl') }}
+          key: fork-image-${{ matrix.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'cross/Dockerfile.*') }}
       - name: Build UI
         run: nix-shell --command 'make build-ui'
-      - name: Build AMD64 binary
-        run: nix-shell --command 'cd chirpstack && make release-amd64'
+      - name: Build binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: nix-shell --command 'cd chirpstack && cross build --locked --target "$TARGET" --release --no-default-features --features=postgres'
+      - name: Set up QEMU
+        if: matrix.arch == 'arm64'
+        uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Log in to GHCR
@@ -54,17 +66,36 @@ jobs:
         with:
           context: .
           file: .github/Dockerfile.fork
-          platforms: linux/amd64
+          platforms: linux/${{ matrix.arch }}
+          build-args: BINARY_PATH=target/${{ matrix.target }}/release/chirpstack
           load: true
-          tags: ghcr.io/trackpac-ltd/chirpstack:sha-${{ github.sha }}
+          tags: ghcr.io/trackpac-ltd/chirpstack:sha-${{ github.sha }}-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
       - name: Smoke test and publish
         env:
+          IMAGE: ghcr.io/trackpac-ltd/chirpstack:sha-${{ github.sha }}-${{ matrix.arch }}
+          PLATFORM: linux/${{ matrix.arch }}
+        run: |
+          docker run --rm --platform "$PLATFORM" "$IMAGE" --version
+          docker push "$IMAGE"
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish multi-platform image
+        env:
           IMAGE: ghcr.io/trackpac-ltd/chirpstack:sha-${{ github.sha }}
         run: |
-          docker run --rm "$IMAGE" --version
-          docker push "$IMAGE"
-          DIGEST=$(docker image inspect "$IMAGE" --format '{{index .RepoDigests 0}}')
-          echo "Pull by digest: \`$DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
+          docker buildx imagetools create --tag "$IMAGE" "$IMAGE-amd64" "$IMAGE-arm64"
+          docker buildx imagetools inspect "$IMAGE" >> "$GITHUB_STEP_SUMMARY"
